@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: poyalo
+          POSTGRES_PASSWORD: poyalo
+          POSTGRES_DB: poyalo
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U poyalo -d poyalo" --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7.4-alpine
+        ports: ['6379:6379']
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql://poyalo:poyalo@localhost:5432/poyalo?schema=public
+      REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm build
+      - run: pnpm typecheck
+      - run: pnpm test
+      - name: Apply migrations to a real PostGIS database
+        run: pnpm --filter @poyalo/api prisma:migrate
+      - name: Schema matches migrations (no drift)
+        working-directory: apps/api
+        # Prisma wipes the shadow DB, so it must be a separate database.
+        run: |
+          PGPASSWORD=poyalo psql -h localhost -U poyalo -d poyalo -c 'CREATE DATABASE poyalo_shadow'
+          npx prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url "postgresql://poyalo:poyalo@localhost:5432/poyalo_shadow" --exit-code
+      - name: OpenAPI spec is up to date
+        run: |
+          pnpm --filter @poyalo/api openapi
+          git diff --exit-code packages/contracts/openapi.json

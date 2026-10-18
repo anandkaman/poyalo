@@ -1,0 +1,93 @@
+# Poyalo dev / single-VPS stack (docs/D7 §1, stages S0–S1). All images come from public registries.
+#
+#   docker compose -f infra/docker/docker-compose.yml up -d                     → postgres+postgis, redis, minio, mailpit
+#   docker compose -f infra/docker/docker-compose.yml --profile app up -d --build  → + api container (port 3000)
+#   bash infra/osrm/prepare.sh                                                   → builds routing data (once, ~20–40 min)
+#   docker compose -f infra/docker/docker-compose.yml --profile osrm up -d       → + OSRM routing (port 5000)
+#
+# SECURITY: every port binds to 127.0.0.1 only. On a VPS, nothing here is reachable from the internet;
+# put a reverse proxy (Caddy/Nginx with TLS) in front of the api when it should be public.
+# Passwords here are dev defaults. Change them (and DATABASE_URL) before storing real data.
+name: poyalo
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: poyalo
+      POSTGRES_PASSWORD: poyalo
+      POSTGRES_DB: poyalo
+    ports: ['127.0.0.1:5432:5432']
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U poyalo -d poyalo']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ['redis-server', '--appendonly', 'yes']
+    ports: ['127.0.0.1:6379:6379']
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # S3-compatible stand-in for Cloudflare R2 (KYC documents, photos)
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: poyalo
+      MINIO_ROOT_PASSWORD: poyalo-secret
+    ports: ['127.0.0.1:9000:9000', '127.0.0.1:9001:9001']
+    volumes: [miniodata:/data]
+    restart: unless-stopped
+
+  # Catches outgoing email in dev: http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.24
+    ports: ['127.0.0.1:1025:1025', '127.0.0.1:8025:8025']
+
+  # The backend. Same image for MODE=api|realtime|worker (docs/D1 §1).
+  api:
+    profiles: [app]
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    environment:
+      NODE_ENV: production
+      MODE: api
+      PORT: 3000
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://poyalo:poyalo@postgres:5432/poyalo?schema=public
+      REDIS_URL: redis://redis:6379
+      OSRM_CAR_URL: http://osrm-car:5000
+      OSRM_BIKE_URL: http://osrm-car:5000
+    ports: ['127.0.0.1:3000:3000']
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  # Self-hosted routing (docs/R1). Needs data from infra/osrm/prepare.sh first.
+  osrm-car:
+    profiles: [osrm]
+    image: ghcr.io/project-osrm/osrm-backend:v5.27.1
+    command: osrm-routed --algorithm mld /data/car/region.osrm
+    ports: ['127.0.0.1:5000:5000']
+    volumes:
+      - ../osrm/data:/data:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

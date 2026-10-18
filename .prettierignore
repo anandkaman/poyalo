@@ -1,0 +1,13 @@
+dist
+coverage
+.turbo
+node_modules
+pnpm-lock.yaml
+docs
+research
+memory
+prompts
+todo
+apps/android
+**/migrations/**/*.sql
+packages/contracts/openapi.json

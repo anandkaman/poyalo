@@ -1,0 +1,96 @@
+# POYALO — TODO (task tracker)
+
+Legend: [ ] open · [~] in progress · [x] done · (Q#) waits for an owner answer (see docs/D0 open questions)
+Phases follow docs/D9. Update this file whenever work starts or finishes.
+
+## P-PLAN — Research & source-of-truth docs  ✅
+- [x] Research maps/routing cost options (research/R1)
+- [x] Research tech stack & vendors (research/R2)
+- [x] D0 product requirements · D1 architecture · D2 DB schema · D3 API design
+- [x] D4 trip lifecycle & dispatch · D5 pricing · D6 admin controls · D7 scaling · D8 security · D9 roadmap
+- [x] todo, memory/, prompts log, readme
+- [x] Owner answers open questions Q1–Q7 (D0), merged into the docs (P-003)
+- [x] R3 vehicle/service research · D10 brand theme & i18n
+- [ ] Owner reviews Q8–Q10 (non-blocking; defaults in D0) and the theme colors in D10
+
+## P0 — Foundation  (code done 2026-10-17; items marked ⚠ are not yet verified against real services)
+- [x] git init, .gitignore, .editorconfig, .gitattributes, pnpm workspace + Turborepo, prettier
+- [x] packages/config (tsconfig bases)
+- [ ] packages/config: ESLint config (deferred; Prettier + tsc strict for now)
+- [x] packages/contracts: headers, error codes, envelope, enums, generated openapi.json
+- [x] infra/docker/docker-compose.yml: postgis 16, redis 7, minio, mailpit, osrm-car (profile) ⚠ not run (no Docker here)
+- [x] infra/osrm/prepare.sh: Geofabrik southern-zone extract → car profile (MLD) ⚠ not run
+- [ ] infra/osrm: tuned two-wheeler profile for bike (moved to P2)
+- [x] apps/api NestJS skeleton: zod env config, pino logger, envelope, error filter + codes, request context (all D3 headers), idempotency interceptor, Redis rate-limit guard, /health + /health/ready, MODE switch
+- [x] Prisma schema D2 §1–2 + init migration (PostGIS/GIST, NULLS NOT DISTINCT, CHECKs), UUIDv7 ids ⚠ migration not yet applied to a DB
+- [x] OpenAPI generation → packages/contracts/openapi.json (no DB needed)
+- [x] 18 tests (unit + e2e with in-memory Redis/Prisma): pass locally
+- [x] GitHub Actions CI: format, build, typecheck, test, migrate on real PostGIS, drift check, OpenAPI freshness ⚠ never run yet (no remote)
+- [x] Pushed to GitHub (https://github.com/anandkaman/poyalo); development continues on the owner's VPS (P-006)
+- [x] apps/api/Dockerfile + compose `app` profile; all compose ports bound to 127.0.0.1 ⚠ image not built yet
+
+## P0.5 — VPS handoff verification  ← START HERE on the VPS
+- [ ] `corepack enable && pnpm install` on the VPS (check Node ≥ 22: `node -v`)
+- [ ] `pnpm infra:up` → postgres/redis/minio/mailpit healthy (`docker compose -f infra/docker/docker-compose.yml ps`)
+- [ ] `cp .env.example apps/api/.env` → `pnpm --filter @poyalo/api prisma:migrate` (first real run of the init migration; fix it if it fails)
+- [ ] `pnpm --filter @poyalo/api doctor` → ✔ postgres, postgis, redis
+- [ ] `pnpm --filter @poyalo/api dev` → `curl 127.0.0.1:3000/health/ready` returns 200
+- [ ] `docker compose -f infra/docker/docker-compose.yml --profile app up -d --build` → api container healthy
+- [ ] Check GitHub Actions ran on the push. Fix CI (format, migrate, drift check, openapi freshness) until green
+- [ ] Optional: `bash infra/osrm/prepare.sh` + osrm profile (check VPS RAM first, ≥ 8 GB for southern-zone)
+- [ ] Remove the ⚠ marks above once verified; log results in memory/SESSION_LOG.md
+
+## P1 — Identity & geo
+- [ ] OTP request/verify (MSG91 adapter + dev console adapter), rate limits
+- [ ] JWT ES256 + refresh rotation, sessions, device binding
+- [ ] Rider/driver profile bootstrap per actor
+- [ ] Regions/zones/vehicle types + region resolver (PostGIS + H3 cache)
+- [ ] Settings service (global→country→region) + Redis cache + pub/sub invalidation
+- [ ] Admin auth (argon2 + TOTP) + RBAC guards + audit log interceptor
+- [ ] Seed: country IN, service types (city, outstation), vehicle types (R3), default settings. **No region rows** (admin creates them)
+- [ ] i18n plumbing: Accept-Language, `name_i18n` resolver, error-code → message catalog (en only)
+
+## P2 — Pricing & quotes
+- [ ] packages/pricing: city (D5 §2a) + outstation (D5 §2b) + commission/subscription (D5 §3), with full unit tests
+- [ ] Admin catalog CRUD: service types, vehicle types, region × service × vehicle enablement
+- [ ] MapsProvider interface + OSRM adapter (route/table/match) + Ola adapter (autocomplete/reverse) + circuit breaker
+- [ ] POST /rider/quotes, fare_quotes + Redis cache
+- [ ] Admin fare-config CRUD, activate, simulate
+
+## P3 — Dispatch & trips
+- [ ] Realtime gateway (Socket.IO, Redis adapter, auth handshake, rooms)
+- [ ] driver:location ingest → Redis GEO/hash; heartbeat sweep
+- [ ] Trip state machine service + trip_events
+- [ ] Dispatch worker (BullMQ), offers, accept lock, timeouts
+- [ ] Daily rejection rule (D4 §4): 3 free, then bonus-wallet deduction via rejection_penalty_rules, waiver, midnight rollover by timezone
+- [ ] Subscription priority boost in ranking (bounded)
+- [ ] Outstation: scheduled bookings, claim-based dispatch, reminders, round-trip day calculation (D4 §7)
+- [ ] Arrived geofence, OTP start, complete → OSRM match → final fare
+- [ ] Driver simulator script (N fake drivers moving on OSRM routes) for E2E tests
+
+## P4 — Driver Android
+- [ ] Gradle multi-module (core, driver-app), Hilt, Retrofit, generated Kotlin client
+- [ ] Login OTP, onboarding + doc upload (signed URLs)
+- [ ] Foreground location service, socket client, offline buffer (Room)
+- [ ] Offer screen (countdown, rejections_left), accept/reject
+- [ ] Google Maps intent navigation (pickup leg / drop leg), trip screens, earnings
+
+## P5 — Rider Android + Web
+- [ ] Design tokens from D10 → Compose theme + Tailwind config (contrast-checked), kolam assets, fonts
+- [ ] rider-app: login, map (MapLibre), City | Outstation tabs, search, quotes, book/schedule, tracking, cancel, rate, history
+- [ ] apps/web: booking flow parity, driver portal (docs, earnings), landing pages
+
+## P6 — Payments
+- [ ] Ledger + wallets (driver earnings + bonus), Razorpay orders/UPI intent, webhooks, refunds, receipts
+- [ ] Cash flow: auto-debit commission+tax from earnings, promo credit-back, negative-balance warn/limit, UPI top-up (D5 §6)
+- [ ] Subscription purchase (UPI / earnings wallet), expiry & auto-renew
+- [ ] RazorpayX payouts (daily/weekly), bonus → earnings transfer, reconciliation reports
+
+## P7 — Admin console
+- [ ] All D6 §3 screens, live map, KYC queue, maker-checker
+
+## P8 — Growth & safety
+- [ ] Promos, referrals, incentives, SOS, share link, support, auto surge worker
+
+## P9 — Hardening & launch
+- [ ] k6 load tests, security review, alerts, runbooks, Play Store release

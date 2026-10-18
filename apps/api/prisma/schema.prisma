@@ -1,0 +1,542 @@
+// Poyalo database schema. Source of truth for structure: docs/D2-database-schema.md
+// Conventions: snake_case columns (same names as the API), UUIDv7 ids, timestamptz, money in paise (BigInt).
+// PostGIS columns are `Unsupported(...)`: rows holding them are written with raw SQL. NULLS NOT DISTINCT + CHECKs are hand-added in migration SQL.
+// P0 covers D2 §1 (geography & configuration) and §2 (identity). Pricing, trips and money tables come in P2/P3/P6.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis, pgcrypto, citext]
+}
+
+// ───────────────────────────── enums (docs/D2 §9) ─────────────────────────────
+
+enum RegionStatus {
+  draft
+  active
+  paused
+}
+
+enum ZoneType {
+  airport
+  railway
+  mall
+  restricted
+  custom
+}
+
+enum SettingScope {
+  global
+  country
+  region
+}
+
+enum UserStatus {
+  active
+  blocked
+  deleted
+}
+
+enum DriverStatus {
+  onboarding
+  pending_review
+  active
+  suspended
+  banned
+}
+
+enum KycStatus {
+  not_submitted
+  pending
+  approved
+  rejected
+  expired
+}
+
+enum DocType {
+  dl
+  rc
+  insurance
+  permit
+  pan
+  aadhaar
+  photo
+}
+
+enum VehicleStatus {
+  pending
+  active
+  inactive
+  rejected
+}
+
+enum AppKind {
+  rider_android
+  driver_android
+  web
+}
+
+enum ActorType {
+  rider
+  driver
+  admin
+  system
+}
+
+enum AdminStatus {
+  active
+  disabled
+}
+
+// ─────────────────────── §1 Geography & configuration ───────────────────────
+
+model Country {
+  id               String       @id @default(uuid(7)) @db.Uuid
+  iso2             String       @unique @db.Char(2)
+  name             String
+  currency         String       @db.Char(3)
+  phone_code       String
+  timezone_default String
+  status           RegionStatus @default(active)
+  created_at       DateTime     @default(now()) @db.Timestamptz(3)
+  updated_at       DateTime     @updatedAt @db.Timestamptz(3)
+  regions          Region[]
+
+  @@map("countries")
+}
+
+/// A service area (city). Created by admins only, never seeded (DEC-013).
+model Region {
+  id          String                                     @id @default(uuid(7)) @db.Uuid
+  country_id  String                                     @db.Uuid
+  code        String                                     @unique // e.g. IN-CHN
+  name        String
+  timezone    String // IANA, e.g. Asia/Kolkata; used for "day" in limits & reports
+  currency    String                                     @db.Char(3)
+  boundary    Unsupported("geography(MultiPolygon,4326)")
+  center      Unsupported("geography(Point,4326)")?
+  status      RegionStatus                               @default(draft)
+  launched_at DateTime?                                  @db.Timestamptz(3)
+  created_at  DateTime                                   @default(now()) @db.Timestamptz(3)
+  updated_at  DateTime                                   @updatedAt @db.Timestamptz(3)
+
+  country          Country                 @relation(fields: [country_id], references: [id])
+  zones            Zone[]
+  service_vehicles RegionServiceVehicle[]
+  drivers          Driver[]
+  vehicles         Vehicle[]
+
+  @@index([status])
+  @@index([boundary], type: Gist)
+  @@map("regions")
+}
+
+model Zone {
+  id         String                                     @id @default(uuid(7)) @db.Uuid
+  region_id  String                                     @db.Uuid
+  code       String
+  name_i18n  Json // {"en": "Chennai Airport"}
+  type       ZoneType
+  boundary   Unsupported("geography(MultiPolygon,4326)")
+  priority   Int                                        @default(0)
+  active     Boolean                                    @default(true)
+  created_at DateTime                                   @default(now()) @db.Timestamptz(3)
+  updated_at DateTime                                   @updatedAt @db.Timestamptz(3)
+
+  region Region @relation(fields: [region_id], references: [id])
+
+  @@unique([region_id, code])
+  @@index([boundary], type: Gist)
+  @@map("zones")
+}
+
+model ServiceType {
+  id                String                 @id @default(uuid(7)) @db.Uuid
+  code              String                 @unique // city | outstation
+  name_i18n         Json
+  description_i18n  Json?
+  requires_schedule Boolean                @default(false)
+  active            Boolean                @default(true)
+  created_at        DateTime               @default(now()) @db.Timestamptz(3)
+  updated_at        DateTime               @updatedAt @db.Timestamptz(3)
+  region_vehicles   RegionServiceVehicle[]
+
+  @@map("service_types")
+}
+
+model VehicleType {
+  id              String                 @id @default(uuid(7)) @db.Uuid
+  code            String                 @unique // bike | auto | mini | sedan | suv | suv_xl
+  name_i18n       Json
+  seats           Int
+  icon_url        String?
+  nav_mode        String                 @default("d") @db.Char(1) // Google Maps intent mode: d=driving, l=two-wheeler
+  sort_order      Int                    @default(0)
+  active          Boolean                @default(true)
+  created_at      DateTime               @default(now()) @db.Timestamptz(3)
+  updated_at      DateTime               @updatedAt @db.Timestamptz(3)
+  region_services RegionServiceVehicle[]
+  vehicles        Vehicle[]
+
+  @@map("vehicle_types")
+}
+
+/// Which vehicle types a rider sees per region and service tab.
+model RegionServiceVehicle {
+  region_id       String  @db.Uuid
+  service_type_id String  @db.Uuid
+  vehicle_type_id String  @db.Uuid
+  enabled         Boolean @default(true)
+  sort_order      Int     @default(0)
+
+  region       Region      @relation(fields: [region_id], references: [id])
+  service_type ServiceType @relation(fields: [service_type_id], references: [id])
+  vehicle_type VehicleType @relation(fields: [vehicle_type_id], references: [id])
+
+  @@id([region_id, service_type_id, vehicle_type_id])
+  @@map("region_service_vehicles")
+}
+
+/// Settings resolve region → country → global → code default (docs/D6 §1).
+model PlatformSetting {
+  id         String       @id @default(uuid(7)) @db.Uuid
+  scope      SettingScope
+  scope_id   String?      @db.Uuid // NULL for global
+  key        String
+  value      Json
+  updated_by String?      @db.Uuid
+  created_at DateTime     @default(now()) @db.Timestamptz(3)
+  updated_at DateTime     @updatedAt @db.Timestamptz(3)
+
+  @@unique([scope, scope_id, key])
+  @@map("platform_settings")
+}
+
+model FeatureFlag {
+  id          String       @id @default(uuid(7)) @db.Uuid
+  key         String
+  scope       SettingScope
+  scope_id    String?      @db.Uuid
+  enabled     Boolean      @default(false)
+  rollout_pct Int          @default(100)
+  rules       Json?
+  created_at  DateTime     @default(now()) @db.Timestamptz(3)
+  updated_at  DateTime     @updatedAt @db.Timestamptz(3)
+
+  @@unique([key, scope, scope_id])
+  @@map("feature_flags")
+}
+
+// ──────────────────────────────── §2 Identity ────────────────────────────────
+
+model User {
+  id             String     @id @default(uuid(7)) @db.Uuid
+  phone_e164     String     @unique
+  email          String?    @db.Citext
+  name           String?
+  photo_url      String?
+  locale         String     @default("en")
+  status         UserStatus @default(active)
+  home_region_id String?    @db.Uuid
+  last_login_at  DateTime?  @db.Timestamptz(3)
+  created_at     DateTime   @default(now()) @db.Timestamptz(3)
+  updated_at     DateTime   @updatedAt @db.Timestamptz(3)
+
+  rider              Rider?
+  driver             Driver?
+  emergency_contacts EmergencyContact[]
+  saved_places       SavedPlace[]
+  device_tokens      DeviceToken[]
+
+  @@map("users")
+}
+
+model Rider {
+  user_id        String   @id @db.Uuid
+  rating_avg     Decimal  @default(5.00) @db.Decimal(3, 2)
+  rating_count   Int      @default(0)
+  wallet_id      String?  @db.Uuid // FK added with wallets (P6)
+  referral_code  String   @unique
+  blocked_reason String?
+  created_at     DateTime @default(now()) @db.Timestamptz(3)
+  updated_at     DateTime @updatedAt @db.Timestamptz(3)
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@map("riders")
+}
+
+model Driver {
+  user_id                String       @id @db.Uuid
+  region_id              String       @db.Uuid
+  status                 DriverStatus @default(onboarding)
+  kyc_status             KycStatus    @default(not_submitted)
+  current_vehicle_id     String?      @db.Uuid
+  rating_avg             Decimal      @default(5.00) @db.Decimal(3, 2)
+  rating_count           Int          @default(0)
+  acceptance_rate        Decimal      @default(1) @db.Decimal(5, 4)
+  cancellation_rate      Decimal      @default(0) @db.Decimal(5, 4)
+  active_subscription_id String?      @db.Uuid // FK added with driver_subscriptions (P6)
+  service_types          String[]     @default(["city"])
+  payout_account         Json? // encrypted reference (docs/D8)
+  earnings_wallet_id     String?      @db.Uuid // FK added with wallets (P6)
+  bonus_wallet_id        String?      @db.Uuid
+  created_at             DateTime     @default(now()) @db.Timestamptz(3)
+  updated_at             DateTime     @updatedAt @db.Timestamptz(3)
+
+  user         User               @relation(fields: [user_id], references: [id])
+  region       Region             @relation(fields: [region_id], references: [id])
+  vehicles     Vehicle[]
+  documents    DriverDocument[]
+  daily_stats  DriverDailyStat[]
+  penalties    DriverPenalty[]
+  sessions     DriverSession[]
+
+  @@index([region_id, status])
+  @@map("drivers")
+}
+
+model Vehicle {
+  id              String        @id @default(uuid(7)) @db.Uuid
+  driver_id       String        @db.Uuid
+  vehicle_type_id String        @db.Uuid
+  region_id       String        @db.Uuid
+  plate_number    String        @unique
+  make            String
+  model           String
+  color           String
+  year            Int
+  status          VehicleStatus @default(pending)
+  created_at      DateTime      @default(now()) @db.Timestamptz(3)
+  updated_at      DateTime      @updatedAt @db.Timestamptz(3)
+
+  driver       Driver           @relation(fields: [driver_id], references: [user_id])
+  vehicle_type VehicleType      @relation(fields: [vehicle_type_id], references: [id])
+  region       Region           @relation(fields: [region_id], references: [id])
+  documents    DriverDocument[]
+
+  @@index([driver_id])
+  @@map("vehicles")
+}
+
+model DriverDocument {
+  id            String    @id @default(uuid(7)) @db.Uuid
+  driver_id     String    @db.Uuid
+  vehicle_id    String?   @db.Uuid
+  type          DocType
+  number_enc    Bytes? // app-level encrypted (docs/D8)
+  file_key      String // private object-storage key
+  expires_on    DateTime? @db.Date
+  status        KycStatus @default(pending)
+  reviewed_by   String?   @db.Uuid
+  reviewed_at   DateTime? @db.Timestamptz(3)
+  reject_reason String?
+  created_at    DateTime  @default(now()) @db.Timestamptz(3)
+  updated_at    DateTime  @updatedAt @db.Timestamptz(3)
+
+  driver  Driver   @relation(fields: [driver_id], references: [user_id])
+  vehicle Vehicle? @relation(fields: [vehicle_id], references: [id])
+
+  @@index([driver_id, type])
+  @@index([status])
+  @@map("driver_documents")
+}
+
+/// One row per driver per local day (region timezone). The daily rejection rule reads and writes it (docs/D4 §4).
+model DriverDailyStat {
+  driver_id         String    @db.Uuid
+  local_date        DateTime  @db.Date
+  region_id         String    @db.Uuid
+  offers            Int       @default(0)
+  accepts           Int       @default(0)
+  rejections        Int       @default(0)
+  timeouts          Int       @default(0)
+  excess_rejections Int       @default(0)
+  penalty_amount    BigInt    @default(0)
+  blocked_until     DateTime? @db.Timestamptz(3)
+  online_seconds    Int       @default(0)
+  trips             Int       @default(0)
+  earnings_amount   BigInt    @default(0)
+  updated_at        DateTime  @updatedAt @db.Timestamptz(3)
+
+  driver Driver @relation(fields: [driver_id], references: [user_id])
+
+  @@id([driver_id, local_date])
+  @@index([region_id, local_date])
+  @@map("driver_daily_stats")
+}
+
+model DriverPenalty {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  driver_id      String    @db.Uuid
+  region_id      String    @db.Uuid
+  local_date     DateTime  @db.Date
+  type           String // excess_rejection | cancellation | no_show
+  offer_id       String?   @db.Uuid // FK added with trip_offers (P3)
+  trip_id        String?   @db.Uuid
+  amount         BigInt
+  applied_amount BigInt // may be less than amount when the bonus balance is low (Q9)
+  ledger_txn_id  String?   @db.Uuid
+  waived_by      String?   @db.Uuid
+  waived_at      DateTime? @db.Timestamptz(3)
+  created_at     DateTime  @default(now()) @db.Timestamptz(3)
+
+  driver Driver @relation(fields: [driver_id], references: [user_id])
+
+  @@index([driver_id, local_date])
+  @@map("driver_penalties")
+}
+
+model DriverSession {
+  id         String    @id @default(uuid(7)) @db.Uuid
+  driver_id  String    @db.Uuid
+  region_id  String    @db.Uuid
+  vehicle_id String?   @db.Uuid
+  online_at  DateTime  @db.Timestamptz(3)
+  offline_at DateTime? @db.Timestamptz(3)
+
+  driver Driver @relation(fields: [driver_id], references: [user_id])
+
+  @@index([driver_id, online_at])
+  @@map("driver_sessions")
+}
+
+model EmergencyContact {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  user_id    String   @db.Uuid
+  name       String
+  phone_e164 String
+  created_at DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@map("emergency_contacts")
+}
+
+model SavedPlace {
+  id         String                               @id @default(uuid(7)) @db.Uuid
+  user_id    String                               @db.Uuid
+  label      String
+  address    String
+  location   Unsupported("geography(Point,4326)")
+  place_ref  String?
+  created_at DateTime                             @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@index([location], type: Gist)
+  @@map("saved_places")
+}
+
+model DeviceToken {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  user_id      String   @db.Uuid
+  app          AppKind
+  fcm_token    String
+  device_id    String
+  app_version  String?
+  last_seen_at DateTime @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [user_id], references: [id])
+
+  @@unique([user_id, app, device_id])
+  @@map("device_tokens")
+}
+
+model OtpRequest {
+  id          String    @id @default(uuid(7)) @db.Uuid
+  phone_e164  String
+  purpose     String // login
+  actor       ActorType
+  code_hash   String
+  attempts    Int       @default(0)
+  expires_at  DateTime  @db.Timestamptz(3)
+  consumed_at DateTime? @db.Timestamptz(3)
+  ip          String?
+  created_at  DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([phone_e164, created_at])
+  @@map("otp_requests")
+}
+
+model Session {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  user_id      String?   @db.Uuid
+  admin_id     String?   @db.Uuid
+  actor        ActorType
+  device_id    String?
+  family_id    String    @db.Uuid // refresh-token rotation family; reuse revokes the family (docs/D8)
+  refresh_hash String    @unique
+  expires_at   DateTime  @db.Timestamptz(3)
+  revoked_at   DateTime? @db.Timestamptz(3)
+  created_at   DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([user_id, actor])
+  @@index([family_id])
+  @@map("sessions")
+}
+
+model AdminUser {
+  id             String      @id @default(uuid(7)) @db.Uuid
+  email          String      @unique @db.Citext
+  name           String
+  password_hash  String
+  mfa_secret_enc Bytes?
+  status         AdminStatus @default(active)
+  created_at     DateTime    @default(now()) @db.Timestamptz(3)
+  updated_at     DateTime    @updatedAt @db.Timestamptz(3)
+
+  roles AdminUserRole[]
+
+  @@map("admin_users")
+}
+
+model AdminRole {
+  id          String                @id @default(uuid(7)) @db.Uuid
+  code        String                @unique // super_admin | ops_manager | support_agent | finance | kyc_reviewer
+  name        String
+  permissions AdminRolePermission[]
+  users       AdminUserRole[]
+
+  @@map("admin_roles")
+}
+
+model AdminPermission {
+  id    String                @id @default(uuid(7)) @db.Uuid
+  code  String                @unique // e.g. pricing.write
+  roles AdminRolePermission[]
+
+  @@map("admin_permissions")
+}
+
+model AdminRolePermission {
+  role_id       String @db.Uuid
+  permission_id String @db.Uuid
+
+  role       AdminRole       @relation(fields: [role_id], references: [id])
+  permission AdminPermission @relation(fields: [permission_id], references: [id])
+
+  @@id([role_id, permission_id])
+  @@map("admin_role_permissions")
+}
+
+/// region_id NULL = the role applies to all regions.
+model AdminUserRole {
+  id        String  @id @default(uuid(7)) @db.Uuid
+  admin_id  String  @db.Uuid
+  role_id   String  @db.Uuid
+  region_id String? @db.Uuid
+
+  admin AdminUser @relation(fields: [admin_id], references: [id])
+  role  AdminRole @relation(fields: [role_id], references: [id])
+
+  @@unique([admin_id, role_id, region_id])
+  @@map("admin_user_roles")
+}

@@ -1,0 +1,115 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "HealthController_live",
+        "parameters": [
+          {
+            "name": "X-Client",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "rider-android",
+                "driver-android",
+                "web",
+                "admin-web"
+              ]
+            }
+          },
+          {
+            "name": "X-App-Version",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Region",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "example": "IN-CHN"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "operationId": "HealthController_ready",
+        "parameters": [
+          {
+            "name": "X-Client",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "rider-android",
+                "driver-android",
+                "web",
+                "admin-web"
+              ]
+            }
+          },
+          {
+            "name": "X-App-Version",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Region",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "example": "IN-CHN"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "tags": [
+          "health"
+        ]
+      }
+    }
+  },
+  "info": {
+    "title": "Poyalo API",
+    "description": "Ride-hailing platform API. Conventions: docs/D3-api-design.md",
+    "version": "v1",
+    "contact": {}
+  },
+  "tags": [],
+  "servers": [],
+  "components": {
+    "securitySchemes": {
+      "bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "type": "http"
+      }
+    },
+    "schemas": {}
+  }
+}
